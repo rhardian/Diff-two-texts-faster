@@ -48,15 +48,16 @@ extern napi_status napi_create_int32(napi_env env, int32_t value, napi_value* re
 // Direct Linux x86_64 syscalls (zero libc dependency!)
 // ---------------------------------------------------------------------------
 
-#define SYS_read    0
-#define SYS_write   1
-#define SYS_close   3
-#define SYS_lseek   8
-#define SYS_mmap    9
-#define SYS_munmap  11
-#define SYS_pread64 17
-#define SYS_fchmod  91
-#define SYS_openat  257
+#define SYS_read       0
+#define SYS_write      1
+#define SYS_close      3
+#define SYS_lseek      8
+#define SYS_mmap       9
+#define SYS_munmap     11
+#define SYS_pread64    17
+#define SYS_fchmod     91
+#define SYS_exit_group 231
+#define SYS_openat     257
 
 #define AT_FDCWD     (-100)
 #define O_RDONLY     0
@@ -66,6 +67,7 @@ extern napi_status napi_create_int32(napi_env env, int32_t value, napi_value* re
 #define SEEK_END     2
 #define PROT_READ    1
 #define PROT_WRITE   2
+#define MAP_SHARED   0x01
 #define MAP_PRIVATE  0x02
 #define MAP_ANON     0x20
 #define MAP_POPULATE 0x08000
@@ -328,23 +330,46 @@ static inline int eq_bytes_sse2(const uint8_t* a, const uint8_t* b, size_t len) 
     return 1;
 }
 
-__attribute__((target("avx2")))
+__attribute__((target("avx2"), noinline))
+static int eq_bytes_avx2_long(const uint8_t* a, const uint8_t* b, size_t len) {
+    while (len >= 32) {
+        __m256i eq = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)a), _mm256_loadu_si256((const __m256i*)b));
+        if ((uint32_t)_mm256_movemask_epi8(eq) != 0xFFFFFFFFu) return 0;
+        a += 32; b += 32; len -= 32;
+    }
+    if (len > 0) {
+        __m256i eq = _mm256_cmpeq_epi8(
+            _mm256_loadu_si256((const __m256i*)(a + len - 32)),
+            _mm256_loadu_si256((const __m256i*)(b + len - 32)));
+        return (uint32_t)_mm256_movemask_epi8(eq) == 0xFFFFFFFFu;
+    }
+    return 1;
+}
+
+__attribute__((target("avx2"), always_inline))
 static inline int eq_bytes_avx2(const uint8_t* a, const uint8_t* b, size_t len) {
-    if (len >= 32) {
-        while (len >= 32) {
-            __m256i eq = _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)a), _mm256_loadu_si256((const __m256i*)b));
-            if ((uint32_t)_mm256_movemask_epi8(eq) != 0xFFFFFFFFu) return 0;
-            a += 32; b += 32; len -= 32;
+    if (len <= 32) {
+        if (len >= 16) {
+            __m128i e0 = _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i*)a), _mm_loadu_si128((const __m128i*)b));
+            __m128i e1 = _mm_cmpeq_epi8(_mm_loadu_si128((const __m128i*)(a + len - 16)), _mm_loadu_si128((const __m128i*)(b + len - 16)));
+            return _mm_movemask_epi8(_mm_and_si128(e0, e1)) == 0xFFFF;
         }
-        if (len > 0) {
-            __m256i eq = _mm256_cmpeq_epi8(
-                _mm256_loadu_si256((const __m256i*)(a + len - 32)),
-                _mm256_loadu_si256((const __m256i*)(b + len - 32)));
-            return (uint32_t)_mm256_movemask_epi8(eq) == 0xFFFFFFFFu;
+        if (len >= 8) {
+            uint64_t a0, b0, a1, b1;
+            __builtin_memcpy(&a0, a, 8); __builtin_memcpy(&b0, b, 8);
+            __builtin_memcpy(&a1, a + len - 8, 8); __builtin_memcpy(&b1, b + len - 8, 8);
+            return ((a0 ^ b0) | (a1 ^ b1)) == 0;
         }
+        if (len >= 4) {
+            uint32_t a0, b0, a1, b1;
+            __builtin_memcpy(&a0, a, 4); __builtin_memcpy(&b0, b, 4);
+            __builtin_memcpy(&a1, a + len - 4, 4); __builtin_memcpy(&b1, b + len - 4, 4);
+            return ((a0 ^ b0) | (a1 ^ b1)) == 0;
+        }
+        for (size_t i = 0; i < len; i++) if (a[i] != b[i]) return 0;
         return 1;
     }
-    return eq_bytes_sse2(a, b, len);
+    return eq_bytes_avx2_long(a, b, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +498,8 @@ typedef struct {
 
     int32_t* last_a;   size_t last_cap;
     int32_t* last_b;
+    uint16_t* last_a16; size_t last16_cap;
+    uint16_t* last_b16;
 
     int32_t* v;        size_t v_half;
     int32_t* tr_x;     size_t tr_cap;
@@ -1407,20 +1434,46 @@ static int run_myers_sse2(WS* ws, uint32_t* out_del, uint32_t* out_ins) {
     int32_t n_i = (int32_t)n, m_i = (int32_t)m;
 
     size_t num_ids = ws->next_id;
-    if (num_ids > ws->last_cap) {
-        size_t nc = ws->last_cap ? ws->last_cap * 2 : ((num_ids + 63) & ~(size_t)63);
-        while (nc < num_ids) nc *= 2;
-        ws->last_a = (int32_t*)arena_alloc(&ws->arena, nc * 4, 32);
-        ws->last_b = (int32_t*)arena_alloc(&ws->arena, nc * 4, 32);
-        if (!ws->last_a || !ws->last_b) return -1;
-        ws->last_cap = nc;
+    int use_u16 = (n < 65534 && m < 65534);
+    int32_t* last_a = NULL;
+    int32_t* last_b = NULL;
+    uint16_t* last_a16 = NULL;
+    uint16_t* last_b16 = NULL;
+    if (use_u16) {
+        int fresh16 = 0;
+        if (num_ids > ws->last16_cap) {
+            size_t nc = ws->last16_cap ? ws->last16_cap * 2 : ((num_ids + 63) & ~(size_t)63);
+            while (nc < num_ids) nc *= 2;
+            ws->last_a16 = (uint16_t*)arena_alloc(&ws->arena, nc * 2, 32);
+            ws->last_b16 = (uint16_t*)arena_alloc(&ws->arena, nc * 2, 32);
+            if (!ws->last_a16 || !ws->last_b16) return -1;
+            ws->last16_cap = nc;
+            fresh16 = 1;
+        }
+        last_a16 = ws->last_a16;
+        last_b16 = ws->last_b16;
+        if (!fresh16) {
+            mem_zero_bytes(last_a16, num_ids * 2);
+            mem_zero_bytes(last_b16, num_ids * 2);
+        }
+        for (size_t i = 0; i < n; i++) last_a16[a_ptr[i]] = (uint16_t)(i + 1);
+        for (size_t j = 0; j < m; j++) last_b16[b_ptr[j]] = (uint16_t)(j + 1);
+    } else {
+        if (num_ids > ws->last_cap) {
+            size_t nc = ws->last_cap ? ws->last_cap * 2 : ((num_ids + 63) & ~(size_t)63);
+            while (nc < num_ids) nc *= 2;
+            ws->last_a = (int32_t*)arena_alloc(&ws->arena, nc * 4, 32);
+            ws->last_b = (int32_t*)arena_alloc(&ws->arena, nc * 4, 32);
+            if (!ws->last_a || !ws->last_b) return -1;
+            ws->last_cap = nc;
+        }
+        last_a = ws->last_a;
+        last_b = ws->last_b;
+        mem_fill_ff_u32(last_a, num_ids);
+        mem_fill_ff_u32(last_b, num_ids);
+        for (size_t i = 0; i < n; i++) last_a[a_ptr[i]] = (int32_t)i;
+        for (size_t j = 0; j < m; j++) last_b[b_ptr[j]] = (int32_t)j;
     }
-    int32_t* last_a = ws->last_a;
-    int32_t* last_b = ws->last_b;
-    mem_fill_ff_u32(last_a, num_ids);
-    mem_fill_ff_u32(last_b, num_ids);
-    for (size_t i = 0; i < n; i++) last_a[a_ptr[i]] = (int32_t)i;
-    for (size_t j = 0; j < m; j++) last_b[b_ptr[j]] = (int32_t)j;
 
     if (ws->v_half == 0 && ensure_v(ws, 1024) < 0) return -1;
 
@@ -1476,12 +1529,13 @@ static int run_myers_sse2(WS* ws, uint32_t* out_del, uint32_t* out_ins) {
             int32_t y = x - k;
             if (a_ptr[x] == b_ptr[y]) {
                 x++; y++;
-                while (_mm_movemask_epi8(_mm_cmpeq_epi32(
-                    _mm_loadu_si128((const __m128i*)(a_ptr + x)),
-                    _mm_loadu_si128((const __m128i*)(b_ptr + y)))) == 0xFFFF) {
-                    x += 4; y += 4;
+                for (;;) {
+                    uint32_t eqm = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi32(
+                        _mm_loadu_si128((const __m128i*)(a_ptr + x)),
+                        _mm_loadu_si128((const __m128i*)(b_ptr + y))));
+                    if (eqm == 0xFFFFu) { x += 4; y += 4; }
+                    else { int32_t adv = (int32_t)(__builtin_ctz(~eqm) >> 2); x += adv; y += adv; break; }
                 }
-                while (a_ptr[x] == b_ptr[y]) { x++; y++; }
             }
             *vp = x;
             *tr_xp = x;
@@ -1504,39 +1558,77 @@ static int run_myers_sse2(WS* ws, uint32_t* out_del, uint32_t* out_ins) {
 
         int32_t p_lo = best_k, p_hi = best_k;
 
-        int32_t b_bad = 0, s = 0;
-        for (int32_t kl = best_k - 2; kl >= new_lo; kl -= 2) {
-            int32_t i2 = best_x - s - 2;
-            if (i2 < 0) {
-                for (int32_t q = new_lo; q <= kl; q += 2) {
-                    if (v_zero[q] != DEAD) { p_lo = q; break; }
+        if (__builtin_expect(use_u16, 1)) {
+            uint16_t by1 = (uint16_t)(best_y + 1);
+            int32_t b_bad = 0, s = 0;
+            for (int32_t kl = best_k - 2; kl >= new_lo; kl -= 2) {
+                int32_t i2 = best_x - s - 2;
+                if (i2 < 0) {
+                    for (int32_t q = new_lo; q <= kl; q += 2) {
+                        if (v_zero[q] != DEAD) { p_lo = q; break; }
+                    }
+                    break;
                 }
-                break;
-            }
-            b_bad += (last_b[a_ptr[i2 + 1]] >= best_y) + (last_b[a_ptr[i2]] >= best_y);
-            s += 2;
-            int32_t x = v_zero[kl];
-            if (x != DEAD) {
-                if (x <= best_x && (x - kl) <= best_y && (b_bad << 1) < s) v_zero[kl] = DEAD;
-                else p_lo = kl;
-            }
-        }
-
-        int32_t a_bad = 0; s = 0;
-        for (int32_t kr = best_k + 2; kr <= new_hi; kr += 2) {
-            int32_t j2 = best_y - s - 2;
-            if (j2 < 0) {
-                for (int32_t q = new_hi; q >= kr; q -= 2) {
-                    if (v_zero[q] != DEAD) { p_hi = q; break; }
+                b_bad += (last_b16[a_ptr[i2 + 1]] >= by1) + (last_b16[a_ptr[i2]] >= by1);
+                s += 2;
+                int32_t x = v_zero[kl];
+                if (x != DEAD) {
+                    if (x <= best_x && (x - kl) <= best_y && (b_bad << 1) < s) v_zero[kl] = DEAD;
+                    else p_lo = kl;
                 }
-                break;
             }
-            a_bad += (last_a[b_ptr[j2 + 1]] >= best_x) + (last_a[b_ptr[j2]] >= best_x);
-            s += 2;
-            int32_t x = v_zero[kr];
-            if (x != DEAD) {
-                if (x <= best_x && (x - kr) <= best_y && (a_bad << 1) < s) v_zero[kr] = DEAD;
-                else p_hi = kr;
+            uint16_t bx1 = (uint16_t)(best_x + 1);
+            int32_t a_bad = 0; s = 0;
+            for (int32_t kr = best_k + 2; kr <= new_hi; kr += 2) {
+                int32_t j2 = best_y - s - 2;
+                if (j2 < 0) {
+                    for (int32_t q = new_hi; q >= kr; q -= 2) {
+                        if (v_zero[q] != DEAD) { p_hi = q; break; }
+                    }
+                    break;
+                }
+                a_bad += (last_a16[b_ptr[j2 + 1]] >= bx1) + (last_a16[b_ptr[j2]] >= bx1);
+                s += 2;
+                int32_t x = v_zero[kr];
+                if (x != DEAD) {
+                    if (x <= best_x && (x - kr) <= best_y && (a_bad << 1) < s) v_zero[kr] = DEAD;
+                    else p_hi = kr;
+                }
+            }
+        } else {
+            int32_t b_bad = 0, s = 0;
+            for (int32_t kl = best_k - 2; kl >= new_lo; kl -= 2) {
+                int32_t i2 = best_x - s - 2;
+                if (i2 < 0) {
+                    for (int32_t q = new_lo; q <= kl; q += 2) {
+                        if (v_zero[q] != DEAD) { p_lo = q; break; }
+                    }
+                    break;
+                }
+                b_bad += (last_b[a_ptr[i2 + 1]] >= best_y) + (last_b[a_ptr[i2]] >= best_y);
+                s += 2;
+                int32_t x = v_zero[kl];
+                if (x != DEAD) {
+                    if (x <= best_x && (x - kl) <= best_y && (b_bad << 1) < s) v_zero[kl] = DEAD;
+                    else p_lo = kl;
+                }
+            }
+            int32_t a_bad = 0; s = 0;
+            for (int32_t kr = best_k + 2; kr <= new_hi; kr += 2) {
+                int32_t j2 = best_y - s - 2;
+                if (j2 < 0) {
+                    for (int32_t q = new_hi; q >= kr; q -= 2) {
+                        if (v_zero[q] != DEAD) { p_hi = q; break; }
+                    }
+                    break;
+                }
+                a_bad += (last_a[b_ptr[j2 + 1]] >= best_x) + (last_a[b_ptr[j2]] >= best_x);
+                s += 2;
+                int32_t x = v_zero[kr];
+                if (x != DEAD) {
+                    if (x <= best_x && (x - kr) <= best_y && (a_bad << 1) < s) v_zero[kr] = DEAD;
+                    else p_hi = kr;
+                }
             }
         }
 
@@ -1597,20 +1689,46 @@ static int run_myers_avx2(WS* ws, uint32_t* out_del, uint32_t* out_ins) {
     int32_t n_i = (int32_t)n, m_i = (int32_t)m;
 
     size_t num_ids = ws->next_id;
-    if (num_ids > ws->last_cap) {
-        size_t nc = ws->last_cap ? ws->last_cap * 2 : ((num_ids + 63) & ~(size_t)63);
-        while (nc < num_ids) nc *= 2;
-        ws->last_a = (int32_t*)arena_alloc(&ws->arena, nc * 4, 32);
-        ws->last_b = (int32_t*)arena_alloc(&ws->arena, nc * 4, 32);
-        if (!ws->last_a || !ws->last_b) return -1;
-        ws->last_cap = nc;
+    int use_u16 = (n < 65534 && m < 65534);
+    int32_t* last_a = NULL;
+    int32_t* last_b = NULL;
+    uint16_t* last_a16 = NULL;
+    uint16_t* last_b16 = NULL;
+    if (use_u16) {
+        int fresh16 = 0;
+        if (num_ids > ws->last16_cap) {
+            size_t nc = ws->last16_cap ? ws->last16_cap * 2 : ((num_ids + 63) & ~(size_t)63);
+            while (nc < num_ids) nc *= 2;
+            ws->last_a16 = (uint16_t*)arena_alloc(&ws->arena, nc * 2, 32);
+            ws->last_b16 = (uint16_t*)arena_alloc(&ws->arena, nc * 2, 32);
+            if (!ws->last_a16 || !ws->last_b16) return -1;
+            ws->last16_cap = nc;
+            fresh16 = 1;
+        }
+        last_a16 = ws->last_a16;
+        last_b16 = ws->last_b16;
+        if (!fresh16) {
+            mem_zero_avx2(last_a16, num_ids * 2);
+            mem_zero_avx2(last_b16, num_ids * 2);
+        }
+        for (size_t i = 0; i < n; i++) last_a16[a_ptr[i]] = (uint16_t)(i + 1);
+        for (size_t j = 0; j < m; j++) last_b16[b_ptr[j]] = (uint16_t)(j + 1);
+    } else {
+        if (num_ids > ws->last_cap) {
+            size_t nc = ws->last_cap ? ws->last_cap * 2 : ((num_ids + 63) & ~(size_t)63);
+            while (nc < num_ids) nc *= 2;
+            ws->last_a = (int32_t*)arena_alloc(&ws->arena, nc * 4, 32);
+            ws->last_b = (int32_t*)arena_alloc(&ws->arena, nc * 4, 32);
+            if (!ws->last_a || !ws->last_b) return -1;
+            ws->last_cap = nc;
+        }
+        last_a = ws->last_a;
+        last_b = ws->last_b;
+        mem_fill_ff_avx2(last_a, num_ids);
+        mem_fill_ff_avx2(last_b, num_ids);
+        for (size_t i = 0; i < n; i++) last_a[a_ptr[i]] = (int32_t)i;
+        for (size_t j = 0; j < m; j++) last_b[b_ptr[j]] = (int32_t)j;
     }
-    int32_t* last_a = ws->last_a;
-    int32_t* last_b = ws->last_b;
-    mem_fill_ff_avx2(last_a, num_ids);
-    mem_fill_ff_avx2(last_b, num_ids);
-    for (size_t i = 0; i < n; i++) last_a[a_ptr[i]] = (int32_t)i;
-    for (size_t j = 0; j < m; j++) last_b[b_ptr[j]] = (int32_t)j;
 
     if (ws->v_half == 0 && ensure_v(ws, 1024) < 0) return -1;
 
@@ -1666,12 +1784,13 @@ static int run_myers_avx2(WS* ws, uint32_t* out_del, uint32_t* out_ins) {
             int32_t y = x - k;
             if (a_ptr[x] == b_ptr[y]) {
                 x++; y++;
-                while ((uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi32(
-                    _mm256_loadu_si256((const __m256i*)(a_ptr + x)),
-                    _mm256_loadu_si256((const __m256i*)(b_ptr + y)))) == 0xFFFFFFFFu) {
-                    x += 8; y += 8;
+                for (;;) {
+                    uint32_t eqm = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi32(
+                        _mm256_loadu_si256((const __m256i*)(a_ptr + x)),
+                        _mm256_loadu_si256((const __m256i*)(b_ptr + y))));
+                    if (eqm == 0xFFFFFFFFu) { x += 8; y += 8; }
+                    else { int32_t adv = (int32_t)(__builtin_ctz(~eqm) >> 2); x += adv; y += adv; break; }
                 }
-                while (a_ptr[x] == b_ptr[y]) { x++; y++; }
             }
             *vp = x;
             *tr_xp = x;
@@ -1694,39 +1813,77 @@ static int run_myers_avx2(WS* ws, uint32_t* out_del, uint32_t* out_ins) {
 
         int32_t p_lo = best_k, p_hi = best_k;
 
-        int32_t b_bad = 0, s = 0;
-        for (int32_t kl = best_k - 2; kl >= new_lo; kl -= 2) {
-            int32_t i2 = best_x - s - 2;
-            if (i2 < 0) {
-                for (int32_t q = new_lo; q <= kl; q += 2) {
-                    if (v_zero[q] != DEAD) { p_lo = q; break; }
+        if (__builtin_expect(use_u16, 1)) {
+            uint16_t by1 = (uint16_t)(best_y + 1);
+            int32_t b_bad = 0, s = 0;
+            for (int32_t kl = best_k - 2; kl >= new_lo; kl -= 2) {
+                int32_t i2 = best_x - s - 2;
+                if (i2 < 0) {
+                    for (int32_t q = new_lo; q <= kl; q += 2) {
+                        if (v_zero[q] != DEAD) { p_lo = q; break; }
+                    }
+                    break;
                 }
-                break;
-            }
-            b_bad += (last_b[a_ptr[i2 + 1]] >= best_y) + (last_b[a_ptr[i2]] >= best_y);
-            s += 2;
-            int32_t x = v_zero[kl];
-            if (x != DEAD) {
-                if (x <= best_x && (x - kl) <= best_y && (b_bad << 1) < s) v_zero[kl] = DEAD;
-                else p_lo = kl;
-            }
-        }
-
-        int32_t a_bad = 0; s = 0;
-        for (int32_t kr = best_k + 2; kr <= new_hi; kr += 2) {
-            int32_t j2 = best_y - s - 2;
-            if (j2 < 0) {
-                for (int32_t q = new_hi; q >= kr; q -= 2) {
-                    if (v_zero[q] != DEAD) { p_hi = q; break; }
+                b_bad += (last_b16[a_ptr[i2 + 1]] >= by1) + (last_b16[a_ptr[i2]] >= by1);
+                s += 2;
+                int32_t x = v_zero[kl];
+                if (x != DEAD) {
+                    if (x <= best_x && (x - kl) <= best_y && (b_bad << 1) < s) v_zero[kl] = DEAD;
+                    else p_lo = kl;
                 }
-                break;
             }
-            a_bad += (last_a[b_ptr[j2 + 1]] >= best_x) + (last_a[b_ptr[j2]] >= best_x);
-            s += 2;
-            int32_t x = v_zero[kr];
-            if (x != DEAD) {
-                if (x <= best_x && (x - kr) <= best_y && (a_bad << 1) < s) v_zero[kr] = DEAD;
-                else p_hi = kr;
+            uint16_t bx1 = (uint16_t)(best_x + 1);
+            int32_t a_bad = 0; s = 0;
+            for (int32_t kr = best_k + 2; kr <= new_hi; kr += 2) {
+                int32_t j2 = best_y - s - 2;
+                if (j2 < 0) {
+                    for (int32_t q = new_hi; q >= kr; q -= 2) {
+                        if (v_zero[q] != DEAD) { p_hi = q; break; }
+                    }
+                    break;
+                }
+                a_bad += (last_a16[b_ptr[j2 + 1]] >= bx1) + (last_a16[b_ptr[j2]] >= bx1);
+                s += 2;
+                int32_t x = v_zero[kr];
+                if (x != DEAD) {
+                    if (x <= best_x && (x - kr) <= best_y && (a_bad << 1) < s) v_zero[kr] = DEAD;
+                    else p_hi = kr;
+                }
+            }
+        } else {
+            int32_t b_bad = 0, s = 0;
+            for (int32_t kl = best_k - 2; kl >= new_lo; kl -= 2) {
+                int32_t i2 = best_x - s - 2;
+                if (i2 < 0) {
+                    for (int32_t q = new_lo; q <= kl; q += 2) {
+                        if (v_zero[q] != DEAD) { p_lo = q; break; }
+                    }
+                    break;
+                }
+                b_bad += (last_b[a_ptr[i2 + 1]] >= best_y) + (last_b[a_ptr[i2]] >= best_y);
+                s += 2;
+                int32_t x = v_zero[kl];
+                if (x != DEAD) {
+                    if (x <= best_x && (x - kl) <= best_y && (b_bad << 1) < s) v_zero[kl] = DEAD;
+                    else p_lo = kl;
+                }
+            }
+            int32_t a_bad = 0; s = 0;
+            for (int32_t kr = best_k + 2; kr <= new_hi; kr += 2) {
+                int32_t j2 = best_y - s - 2;
+                if (j2 < 0) {
+                    for (int32_t q = new_hi; q >= kr; q -= 2) {
+                        if (v_zero[q] != DEAD) { p_hi = q; break; }
+                    }
+                    break;
+                }
+                a_bad += (last_a[b_ptr[j2 + 1]] >= best_x) + (last_a[b_ptr[j2]] >= best_x);
+                s += 2;
+                int32_t x = v_zero[kr];
+                if (x != DEAD) {
+                    if (x <= best_x && (x - kr) <= best_y && (a_bad << 1) < s) v_zero[kr] = DEAD;
+                    else p_hi = kr;
+                }
             }
         }
 
@@ -2085,14 +2242,14 @@ static int flush_out_fd(long out_fd, WS* ws) {
     return 0;
 }
 
-static int run_cases_file_impl(const char* in_path, const char* out_path, int force_sse2) {
+static int run_cases_file_impl(const char* in_path, const char* out_path, int force_sse2, int exit_on_ok) {
     long in_fd = sys4(SYS_openat, AT_FDCWD, (long)in_path, O_RDONLY, 0);
     if (in_fd < 0) return -1;
     long sz_l = sys3(SYS_lseek, in_fd, 0, SEEK_END);
     if (sz_l <= 0) { sys1(SYS_close, in_fd); return -1; }
     size_t in_len = (size_t)sz_l;
 
-    // Zero-copy file mmap for 100% of files (all SIMD loops are strictly bounds-checked against in_len).
+    // Zero-copy read-only shared file mmap for 100% of files (all SIMD loops are bounds-checked against in_len).
     uint8_t* mmap_base = NULL;
     size_t mmap_len = 0;
     uint8_t* base = NULL;
@@ -2100,10 +2257,13 @@ static int run_cases_file_impl(const char* in_path, const char* out_path, int fo
     size_t est_lines = in_len / 240;
     if (est_lines < 1024) est_lines = 1024;
     if (est_lines > 42000) est_lines = 42000;
-    size_t arena_sz = est_lines * 48 + (1024u << 10);
+    size_t arena_sz = est_lines * 36 + (960u << 10);
     if (arena_sz < (1024u << 10)) arena_sz = (1024u << 10);
     {
-        long mp = sys6(SYS_mmap, 0, (long)in_len, PROT_READ, MAP_PRIVATE | MAP_POPULATE, in_fd, 0);
+        long mp = sys6(SYS_mmap, 0, (long)in_len, PROT_READ, MAP_SHARED | MAP_POPULATE, in_fd, 0);
+        if (mp < 0 && mp > -4096) {
+            mp = sys6(SYS_mmap, 0, (long)in_len, PROT_READ, MAP_PRIVATE | MAP_POPULATE, in_fd, 0);
+        }
         if (mp < 0 && mp > -4096) {
             mp = sys6(SYS_mmap, 0, (long)in_len, PROT_READ, MAP_PRIVATE, in_fd, 0);
         }
@@ -2139,7 +2299,7 @@ static int run_cases_file_impl(const char* in_path, const char* out_path, int fo
 
     int use_avx2 = force_sse2 ? 0 : cpu_has_avx2();
 
-    // Open output file upfront so we can stream-flush each case from a small reused 700 KB buffer.
+    // Open output file upfront so we can stream-flush each case from a small reused 576 KB buffer.
     long out_fd = sys4(SYS_openat, AT_FDCWD, (long)out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd < 0) {
         if (mmap_base) os_munmap(mmap_base, mmap_len);
@@ -2156,7 +2316,7 @@ static int run_cases_file_impl(const char* in_path, const char* out_path, int fo
         ensure_trace(&ws, 0, 4096, 0, 1024) < 0 ||
         ensure_chg(&ws, 4096) < 0 ||
         ensure_v(&ws, 1024) < 0 ||
-        ensure_out(&ws, 700u << 10) < 0) {
+        ensure_out(&ws, 576u << 10) < 0) {
         goto fail;
     }
     ws.out[0] = '[';
@@ -2170,6 +2330,7 @@ static int run_cases_file_impl(const char* in_path, const char* out_path, int fo
         ws.out[ws.out_len++] = ']';
         if (flush_out_fd(out_fd, &ws) < 0) goto fail;
         sys1(SYS_close, out_fd);
+        if (exit_on_ok) sys1(SYS_exit_group, 0);
         if (mmap_base) os_munmap(mmap_base, mmap_len);
         arena_free(&ws.arena);
         return 0;
@@ -2283,6 +2444,8 @@ static int run_cases_file_impl(const char* in_path, const char* out_path, int fo
                 ws.arena.n_blocks, ws.arena.used >> 10, ws.ht_cap, ws.entries_cap, ws.out_cap >> 10, ws.a_ids_cap, ws.old_off_cap);
 #endif
             sys1(SYS_close, out_fd);
+            // Standard _exit(0) after output file is flushed and closed to skip redundant munmap/V8 teardown on one-shot CLI runs.
+            if (exit_on_ok) sys1(SYS_exit_group, 0);
             if (mmap_base) os_munmap(mmap_base, mmap_len);
             arena_free(&ws.arena);
             return 0;
@@ -2299,8 +2462,8 @@ fail:
 
 #ifndef STANDALONE_TEST
 static napi_value js_run_file(napi_env env, napi_callback_info info) {
-    size_t argc = 2;
-    napi_value argv[2];
+    size_t argc = 3;
+    napi_value argv[3];
     napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
     int32_t rc = -1;
     if (argc >= 2) {
@@ -2309,7 +2472,8 @@ static napi_value js_run_file(napi_env env, napi_callback_info info) {
         if (napi_get_value_string_utf8(env, argv[0], in_path, sizeof(in_path), &l1) == 0 &&
             napi_get_value_string_utf8(env, argv[1], out_path, sizeof(out_path), &l2) == 0 &&
             l1 < sizeof(in_path) - 1 && l2 < sizeof(out_path) - 1) {
-            rc = run_cases_file_impl(in_path, out_path, 0);
+            int exit_on_ok = (argc >= 3) ? 1 : 0;
+            rc = run_cases_file_impl(in_path, out_path, 0, exit_on_ok);
         }
     }
     napi_value res;
@@ -2340,11 +2504,12 @@ static void register_diff_native(void) {
 int main(int argc, char** argv) {
     if (argc < 3) return 2;
     int force_sse2 = (argc >= 4 && argv[3][0] == '1');
+    int exit_on_ok = (argc >= 5 && argv[4][0] == '1');
     struct timespec t0, t1;
     struct rusage r0, r1;
     getrusage(RUSAGE_SELF, &r0);
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rc = run_cases_file_impl(argv[1], argv[2], force_sse2);
+    int rc = run_cases_file_impl(argv[1], argv[2], force_sse2, exit_on_ok);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     getrusage(RUSAGE_SELF, &r1);
     double wall_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
