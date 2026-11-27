@@ -234,6 +234,31 @@ static inline void mem_copy_bytes_avx2(void* dst, const void* src, size_t n) {
     while (n--) *d++ = *s++;
 }
 
+static inline void mem_move_left(uint8_t* dst, const uint8_t* src, size_t n) {
+    size_t gap = (size_t)(src - dst);
+    if (gap >= 64) {
+        while (n >= 64) {
+            __m128i a = _mm_loadu_si128((const __m128i*)(src));
+            __m128i b = _mm_loadu_si128((const __m128i*)(src + 16));
+            __m128i c = _mm_loadu_si128((const __m128i*)(src + 32));
+            __m128i d = _mm_loadu_si128((const __m128i*)(src + 48));
+            _mm_storeu_si128((__m128i*)(dst), a);
+            _mm_storeu_si128((__m128i*)(dst + 16), b);
+            _mm_storeu_si128((__m128i*)(dst + 32), c);
+            _mm_storeu_si128((__m128i*)(dst + 48), d);
+            dst += 64; src += 64; n -= 64;
+        }
+    }
+    if (gap >= 16) {
+        while (n >= 16) {
+            __m128i a = _mm_loadu_si128((const __m128i*)src);
+            _mm_storeu_si128((__m128i*)dst, a);
+            dst += 16; src += 16; n -= 16;
+        }
+    }
+    while (n--) *dst++ = *src++;
+}
+
 static inline void mem_copy_bytes(void* dst, const void* src, size_t n) {
     uint8_t* d = (uint8_t*)dst;
     const uint8_t* s = (const uint8_t*)src;
@@ -797,11 +822,14 @@ static inline uint32_t intern_new_inline(WS* __restrict ws, const uint8_t* __res
 // Fast canonical JSON scanners: BOTH SSE2 (16B) and AVX2 (32B) variants!
 // ---------------------------------------------------------------------------
 
+#define SCAN_ERR   ((size_t)-1)
+#define SCAN_TRUNC ((size_t)-2)
+
 static inline size_t scan_json_old_sse2(WS* ws, const uint8_t* base, size_t start, size_t file_len, int* bare_out) {
     ws->a_len = 0;
     *bare_out = 0;
-    if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, 0, 1024) < 0) return (size_t)-1;
-    if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, 0, 1024) < 0) return (size_t)-1;
+    if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, 0, 1024) < 0) return SCAN_ERR;
+    if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, 0, 1024) < 0) return SCAN_ERR;
     uint32_t* a_ids = ws->a_ids;
     uint32_t* old_off = ws->old_off;
     size_t a_cap = ws->a_ids_cap;
@@ -829,25 +857,27 @@ static inline size_t scan_json_old_sse2(WS* ws, const uint8_t* base, size_t star
         } else {
             hit = p;
             while (hit < file_len && base[hit] != '\\' && base[hit] != '"') hit++;
-            if (hit >= file_len) return (size_t)-1;
+            if (hit >= file_len) return SCAN_TRUNC;
         }
         size_t line_end;
         int is_eof = 0;
         if (base[hit] == '\\') {
-            if (__builtin_expect(hit + 1 >= file_len, 0)) return (size_t)-1;
+            if (__builtin_expect(hit + 1 >= file_len, 0)) return SCAN_TRUNC;
             uint8_t nxt = base[hit + 1];
             if (nxt == 'n') {
                 line_end = hit + 2;
             } else if (nxt == 'r') {
                 if (hit + 3 < file_len && base[hit + 2] == '\\' && base[hit + 3] == 'n') {
                     line_end = hit + 4;
+                } else if (hit + 2 >= file_len || (base[hit + 2] == '\\' && hit + 3 >= file_len)) {
+                    return SCAN_TRUNC;
                 } else {
                     p = hit + 2; rehash = 1; continue;
                 }
             } else if (nxt == '"' || nxt == '\\' || nxt == 't' || nxt == 'b' || nxt == 'f') {
                 p = hit + 2; rehash = 1; continue;
             } else {
-                return (size_t)-1;
+                return SCAN_ERR;
             }
         } else {
             line_end = hit;
@@ -859,10 +889,10 @@ static inline size_t scan_json_old_sse2(WS* ws, const uint8_t* base, size_t star
                 size_t line_len = line_end - line_start;
                 uint64_t fh = !rehash ? mix_tail(h, base + p, line_end - p) : hash_bytes(base + line_start, line_len);
                 uint32_t id = intern_old_inline(ws, base, (uint32_t)line_start, (uint32_t)line_len, fh, (uint32_t)n_lines);
-                if (id == 0xFFFFFFFFu) return (size_t)-1;
+                if (id == 0xFFFFFFFFu) return SCAN_ERR;
                 if (n_lines + 2 > a_cap || n_lines + 3 > o_cap) {
-                    if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, n_lines, n_lines + 2) < 0) return (size_t)-1;
-                    if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, n_lines + 1, n_lines + 3) < 0) return (size_t)-1;
+                    if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, n_lines, n_lines + 2) < 0) return SCAN_ERR;
+                    if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, n_lines + 1, n_lines + 3) < 0) return SCAN_ERR;
                     a_ids = ws->a_ids; a_cap = ws->a_ids_cap;
                     old_off = ws->old_off; o_cap = ws->old_off_cap;
                 }
@@ -888,10 +918,10 @@ static inline size_t scan_json_old_sse2(WS* ws, const uint8_t* base, size_t star
             fh = hash_bytes(base + line_start, line_len);
         }
         uint32_t id = intern_old_inline(ws, base, (uint32_t)line_start, (uint32_t)line_len, fh, (uint32_t)n_lines);
-        if (id == 0xFFFFFFFFu) return (size_t)-1;
+        if (id == 0xFFFFFFFFu) return SCAN_ERR;
         if (__builtin_expect(n_lines + 2 > a_cap || n_lines + 3 > o_cap, 0)) {
-            if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, n_lines, n_lines + 2) < 0) return (size_t)-1;
-            if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, n_lines + 1, n_lines + 3) < 0) return (size_t)-1;
+            if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, n_lines, n_lines + 2) < 0) return SCAN_ERR;
+            if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, n_lines + 1, n_lines + 3) < 0) return SCAN_ERR;
             a_ids = ws->a_ids; a_cap = ws->a_ids_cap;
             old_off = ws->old_off; o_cap = ws->old_off_cap;
         }
@@ -909,8 +939,8 @@ __attribute__((target("avx2,bmi")))
 static size_t scan_json_old_avx2(WS* ws, const uint8_t* base, size_t start, size_t file_len, int* bare_out) {
     ws->a_len = 0;
     *bare_out = 0;
-    if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, 0, 1024) < 0) return (size_t)-1;
-    if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, 0, 1024) < 0) return (size_t)-1;
+    if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, 0, 1024) < 0) return SCAN_ERR;
+    if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, 0, 1024) < 0) return SCAN_ERR;
     uint32_t* a_ids = ws->a_ids;
     uint32_t* old_off = ws->old_off;
     size_t a_cap = ws->a_ids_cap;
@@ -939,25 +969,27 @@ static size_t scan_json_old_avx2(WS* ws, const uint8_t* base, size_t start, size
         } else {
             hit = p;
             while (hit < file_len && base[hit] != '\\' && base[hit] != '"') hit++;
-            if (hit >= file_len) return (size_t)-1;
+            if (hit >= file_len) return SCAN_TRUNC;
         }
         size_t line_end;
         int is_eof = 0;
         if (base[hit] == '\\') {
-            if (__builtin_expect(hit + 1 >= file_len, 0)) return (size_t)-1;
+            if (__builtin_expect(hit + 1 >= file_len, 0)) return SCAN_TRUNC;
             uint8_t nxt = base[hit + 1];
             if (nxt == 'n') {
                 line_end = hit + 2;
             } else if (nxt == 'r') {
                 if (hit + 3 < file_len && base[hit + 2] == '\\' && base[hit + 3] == 'n') {
                     line_end = hit + 4;
+                } else if (hit + 2 >= file_len || (base[hit + 2] == '\\' && hit + 3 >= file_len)) {
+                    return SCAN_TRUNC;
                 } else {
                     p = hit + 2; rehash = 1; continue;
                 }
             } else if (nxt == '"' || nxt == '\\' || nxt == 't' || nxt == 'b' || nxt == 'f') {
                 p = hit + 2; rehash = 1; continue;
             } else {
-                return (size_t)-1;
+                return SCAN_ERR;
             }
         } else {
             line_end = hit;
@@ -977,10 +1009,10 @@ static size_t scan_json_old_avx2(WS* ws, const uint8_t* base, size_t start, size
                     fh = hash_bytes(base + line_start, line_len);
                 }
                 uint32_t id = intern_old_avx2(ws, base, (uint32_t)line_start, (uint32_t)line_len, fh, (uint32_t)n_lines);
-                if (id == 0xFFFFFFFFu) return (size_t)-1;
+                if (id == 0xFFFFFFFFu) return SCAN_ERR;
                 if (n_lines + 2 > a_cap || n_lines + 3 > o_cap) {
-                    if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, n_lines, n_lines + 2) < 0) return (size_t)-1;
-                    if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, n_lines + 1, n_lines + 3) < 0) return (size_t)-1;
+                    if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, n_lines, n_lines + 2) < 0) return SCAN_ERR;
+                    if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, n_lines + 1, n_lines + 3) < 0) return SCAN_ERR;
                     a_ids = ws->a_ids; a_cap = ws->a_ids_cap;
                     old_off = ws->old_off; o_cap = ws->old_off_cap;
                 }
@@ -1004,10 +1036,10 @@ static size_t scan_json_old_avx2(WS* ws, const uint8_t* base, size_t start, size
             fh = hash_bytes(base + line_start, line_len);
         }
         uint32_t id = intern_old_avx2(ws, base, (uint32_t)line_start, (uint32_t)line_len, fh, (uint32_t)n_lines);
-        if (id == 0xFFFFFFFFu) return (size_t)-1;
+        if (id == 0xFFFFFFFFu) return SCAN_ERR;
         if (__builtin_expect(n_lines + 2 > a_cap || n_lines + 3 > o_cap, 0)) {
-            if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, n_lines, n_lines + 2) < 0) return (size_t)-1;
-            if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, n_lines + 1, n_lines + 3) < 0) return (size_t)-1;
+            if (ensure_u32(&ws->arena, &ws->a_ids, &ws->a_ids_cap, n_lines, n_lines + 2) < 0) return SCAN_ERR;
+            if (ensure_u32(&ws->arena, &ws->old_off, &ws->old_off_cap, n_lines + 1, n_lines + 3) < 0) return SCAN_ERR;
             a_ids = ws->a_ids; a_cap = ws->a_ids_cap;
             old_off = ws->old_off; o_cap = ws->old_off_cap;
         }
@@ -1024,8 +1056,8 @@ static size_t scan_json_old_avx2(WS* ws, const uint8_t* base, size_t start, size
 static size_t scan_json_new_sse2(WS* ws, const uint8_t* base, size_t start, size_t file_len, int old_bare, int* bare_out) {
     ws->b_len = 0;
     *bare_out = 0;
-    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, 0, 1024) < 0) return (size_t)-1;
-    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, 0, 1024) < 0) return (size_t)-1;
+    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, 0, 1024) < 0) return SCAN_ERR;
+    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, 0, 1024) < 0) return SCAN_ERR;
     uint32_t* b_ids = ws->b_ids;
     uint32_t* new_off = ws->new_off;
     size_t b_cap = ws->b_ids_cap;
@@ -1069,8 +1101,8 @@ static size_t scan_json_new_sse2(WS* ws, const uint8_t* base, size_t start, size
                 while (k < n_old_nl && (size_t)ooff[k + 1] <= old_reached) k++;
                 size_t count = k - pred;
                 if (m_lines + count + 2 > b_cap || m_lines + count + 3 > n_cap) {
-                    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + count + 2) < 0) return (size_t)-1;
-                    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + count + 3) < 0) return (size_t)-1;
+                    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + count + 2) < 0) return SCAN_ERR;
+                    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + count + 3) < 0) return SCAN_ERR;
                     b_ids = ws->b_ids; b_cap = ws->b_ids_cap;
                     new_off = ws->new_off; n_cap = ws->new_off_cap;
                 }
@@ -1107,18 +1139,19 @@ static size_t scan_json_new_sse2(WS* ws, const uint8_t* base, size_t start, size
             } else {
                 hit = p;
                 while (hit < file_len && base[hit] != '\\' && base[hit] != '"') hit++;
-                if (hit >= file_len) return (size_t)-1;
+                if (hit >= file_len) return SCAN_TRUNC;
             }
             if (base[hit] == '\\') {
-                if (__builtin_expect(hit + 1 >= file_len, 0)) return (size_t)-1;
+                if (__builtin_expect(hit + 1 >= file_len, 0)) return SCAN_TRUNC;
                 uint8_t nxt = base[hit + 1];
                 if (nxt == 'n') { line_end = hit + 2; break; }
                 else if (nxt == 'r') {
                     if (hit + 3 < file_len && base[hit + 2] == '\\' && base[hit + 3] == 'n') { line_end = hit + 4; break; }
+                    if (hit + 2 >= file_len || (base[hit + 2] == '\\' && hit + 3 >= file_len)) return SCAN_TRUNC;
                     p = hit + 2; rehash = 1; continue;
                 } else if (nxt == '"' || nxt == '\\' || nxt == 't' || nxt == 'b' || nxt == 'f') {
                     p = hit + 2; rehash = 1; continue;
-                } else return (size_t)-1;
+                } else return SCAN_ERR;
             } else {
                 line_end = hit; is_eof = 1; break;
             }
@@ -1129,10 +1162,10 @@ static size_t scan_json_new_sse2(WS* ws, const uint8_t* base, size_t start, size
                 size_t line_len = line_end - line_start;
                 uint64_t fh = !rehash ? mix_tail(h, base + p, line_end - p) : hash_bytes(base + line_start, line_len);
                 uint32_t id = intern_new_inline(ws, base, (uint32_t)line_start, (uint32_t)line_len, fh);
-                if (id == 0xFFFFFFFFu) return (size_t)-1;
+                if (id == 0xFFFFFFFFu) return SCAN_ERR;
                 if (m_lines + 2 > b_cap || m_lines + 3 > n_cap) {
-                    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + 2) < 0) return (size_t)-1;
-                    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + 3) < 0) return (size_t)-1;
+                    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + 2) < 0) return SCAN_ERR;
+                    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + 3) < 0) return SCAN_ERR;
                     b_ids = ws->b_ids; b_cap = ws->b_ids_cap;
                     new_off = ws->new_off; n_cap = ws->new_off_cap;
                 }
@@ -1158,10 +1191,10 @@ static size_t scan_json_new_sse2(WS* ws, const uint8_t* base, size_t start, size
             fh = hash_bytes(base + line_start, line_len);
         }
         uint32_t id = intern_new_inline(ws, base, (uint32_t)line_start, (uint32_t)line_len, fh);
-        if (id == 0xFFFFFFFFu) return (size_t)-1;
+        if (id == 0xFFFFFFFFu) return SCAN_ERR;
         if (__builtin_expect(m_lines + 2 > b_cap || m_lines + 3 > n_cap, 0)) {
-            if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + 2) < 0) return (size_t)-1;
-            if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + 3) < 0) return (size_t)-1;
+            if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + 2) < 0) return SCAN_ERR;
+            if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + 3) < 0) return SCAN_ERR;
             b_ids = ws->b_ids; b_cap = ws->b_ids_cap;
             new_off = ws->new_off; n_cap = ws->new_off_cap;
         }
@@ -1184,8 +1217,8 @@ __attribute__((target("avx2,bmi")))
 static size_t scan_json_new_avx2(WS* ws, const uint8_t* base, size_t start, size_t file_len, int old_bare, int* bare_out) {
     ws->b_len = 0;
     *bare_out = 0;
-    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, 0, 1024) < 0) return (size_t)-1;
-    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, 0, 1024) < 0) return (size_t)-1;
+    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, 0, 1024) < 0) return SCAN_ERR;
+    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, 0, 1024) < 0) return SCAN_ERR;
     uint32_t* b_ids = ws->b_ids;
     uint32_t* new_off = ws->new_off;
     size_t b_cap = ws->b_ids_cap;
@@ -1229,8 +1262,8 @@ static size_t scan_json_new_avx2(WS* ws, const uint8_t* base, size_t start, size
                 while (k < n_old_nl && (size_t)ooff[k + 1] <= old_reached) k++;
                 size_t count = k - pred;
                 if (m_lines + count + 2 > b_cap || m_lines + count + 3 > n_cap) {
-                    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + count + 2) < 0) return (size_t)-1;
-                    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + count + 3) < 0) return (size_t)-1;
+                    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + count + 2) < 0) return SCAN_ERR;
+                    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + count + 3) < 0) return SCAN_ERR;
                     b_ids = ws->b_ids; b_cap = ws->b_ids_cap;
                     new_off = ws->new_off; n_cap = ws->new_off_cap;
                 }
@@ -1268,18 +1301,19 @@ static size_t scan_json_new_avx2(WS* ws, const uint8_t* base, size_t start, size
             } else {
                 hit = p;
                 while (hit < file_len && base[hit] != '\\' && base[hit] != '"') hit++;
-                if (hit >= file_len) return (size_t)-1;
+                if (hit >= file_len) return SCAN_TRUNC;
             }
             if (base[hit] == '\\') {
-                if (__builtin_expect(hit + 1 >= file_len, 0)) return (size_t)-1;
+                if (__builtin_expect(hit + 1 >= file_len, 0)) return SCAN_TRUNC;
                 uint8_t nxt = base[hit + 1];
                 if (nxt == 'n') { line_end = hit + 2; break; }
                 else if (nxt == 'r') {
                     if (hit + 3 < file_len && base[hit + 2] == '\\' && base[hit + 3] == 'n') { line_end = hit + 4; break; }
+                    if (hit + 2 >= file_len || (base[hit + 2] == '\\' && hit + 3 >= file_len)) return SCAN_TRUNC;
                     p = hit + 2; rehash = 1; continue;
                 } else if (nxt == '"' || nxt == '\\' || nxt == 't' || nxt == 'b' || nxt == 'f') {
                     p = hit + 2; rehash = 1; continue;
-                } else return (size_t)-1;
+                } else return SCAN_ERR;
             } else {
                 line_end = hit; is_eof = 1; break;
             }
@@ -1298,10 +1332,10 @@ static size_t scan_json_new_avx2(WS* ws, const uint8_t* base, size_t start, size
                     fh = hash_bytes(base + line_start, line_len);
                 }
                 uint32_t id = intern_new_avx2(ws, base, (uint32_t)line_start, (uint32_t)line_len, fh);
-                if (id == 0xFFFFFFFFu) return (size_t)-1;
+                if (id == 0xFFFFFFFFu) return SCAN_ERR;
                 if (m_lines + 2 > b_cap || m_lines + 3 > n_cap) {
-                    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + 2) < 0) return (size_t)-1;
-                    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + 3) < 0) return (size_t)-1;
+                    if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + 2) < 0) return SCAN_ERR;
+                    if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + 3) < 0) return SCAN_ERR;
                     b_ids = ws->b_ids; b_cap = ws->b_ids_cap;
                     new_off = ws->new_off; n_cap = ws->new_off_cap;
                 }
@@ -1325,10 +1359,10 @@ static size_t scan_json_new_avx2(WS* ws, const uint8_t* base, size_t start, size
             fh = hash_bytes(base + line_start, line_len);
         }
         uint32_t id = intern_new_avx2(ws, base, (uint32_t)line_start, (uint32_t)line_len, fh);
-        if (id == 0xFFFFFFFFu) return (size_t)-1;
+        if (id == 0xFFFFFFFFu) return SCAN_ERR;
         if (__builtin_expect(m_lines + 2 > b_cap || m_lines + 3 > n_cap, 0)) {
-            if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + 2) < 0) return (size_t)-1;
-            if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + 3) < 0) return (size_t)-1;
+            if (ensure_u32(&ws->arena, &ws->b_ids, &ws->b_ids_cap, m_lines, m_lines + 2) < 0) return SCAN_ERR;
+            if (ensure_u32(&ws->arena, &ws->new_off, &ws->new_off_cap, m_lines + 1, m_lines + 3) < 0) return SCAN_ERR;
             b_ids = ws->b_ids; b_cap = ws->b_ids_cap;
             new_off = ws->new_off; n_cap = ws->new_off_cap;
         }
@@ -2177,10 +2211,10 @@ static size_t skip_json_string(const uint8_t* base, size_t p, size_t len) {
         } else {
             hit = p;
             while (hit < len && base[hit] != '\\' && base[hit] != '"') hit++;
-            if (hit >= len) return (size_t)-1;
+            if (hit >= len) return SCAN_TRUNC;
         }
         if (base[hit] == '\\') {
-            if (hit + 1 >= len) return (size_t)-1;
+            if (hit + 1 >= len) return SCAN_TRUNC;
             p = hit + 2;
         } else return hit + 1;
     }
@@ -2188,47 +2222,51 @@ static size_t skip_json_string(const uint8_t* base, size_t p, size_t len) {
 
 static size_t skip_json_value(const uint8_t* base, size_t p, size_t len) {
     p = skip_ws(base, p, len);
-    if (p >= len) return (size_t)-1;
+    if (p >= len) return SCAN_TRUNC;
     uint8_t c = base[p];
     if (c == '"') return skip_json_string(base, p + 1, len);
     if (c == '{') {
         p = skip_ws(base, p + 1, len);
-        if (p < len && base[p] == '}') return p + 1;
+        if (p >= len) return SCAN_TRUNC;
+        if (base[p] == '}') return p + 1;
         for (;;) {
             p = skip_ws(base, p, len);
-            if (p >= len || base[p] != '"') return (size_t)-1;
+            if (p >= len) return SCAN_TRUNC;
+            if (base[p] != '"') return SCAN_ERR;
             p = skip_json_string(base, p + 1, len);
-            if (p == (size_t)-1) return (size_t)-1;
+            if (p >= SCAN_TRUNC) return p;
             p = skip_ws(base, p, len);
-            if (p >= len || base[p] != ':') return (size_t)-1;
+            if (p >= len) return SCAN_TRUNC;
+            if (base[p] != ':') return SCAN_ERR;
             p = skip_json_value(base, p + 1, len);
-            if (p == (size_t)-1) return (size_t)-1;
+            if (p >= SCAN_TRUNC) return p;
             p = skip_ws(base, p, len);
-            if (p >= len) return (size_t)-1;
+            if (p >= len) return SCAN_TRUNC;
             if (base[p] == ',') p++;
             else if (base[p] == '}') return p + 1;
-            else return (size_t)-1;
+            else return SCAN_ERR;
         }
     }
     if (c == '[') {
         p = skip_ws(base, p + 1, len);
-        if (p < len && base[p] == ']') return p + 1;
+        if (p >= len) return SCAN_TRUNC;
+        if (base[p] == ']') return p + 1;
         for (;;) {
             p = skip_json_value(base, p, len);
-            if (p == (size_t)-1) return (size_t)-1;
+            if (p >= SCAN_TRUNC) return p;
             p = skip_ws(base, p, len);
-            if (p >= len) return (size_t)-1;
+            if (p >= len) return SCAN_TRUNC;
             if (base[p] == ',') p++;
             else if (base[p] == ']') return p + 1;
-            else return (size_t)-1;
+            else return SCAN_ERR;
         }
     }
     while (p < len) {
         uint8_t b = base[p];
-        if (b == ',' || b == '}' || b == ']' || b == ' ' || b == '\n' || b == '\r' || b == '\t') break;
+        if (b == ',' || b == '}' || b == ']' || b == ' ' || b == '\n' || b == '\r' || b == '\t') return p;
         p++;
     }
-    return p;
+    return SCAN_TRUNC;
 }
 
 static int flush_out_fd(long out_fd, WS* ws) {
@@ -2242,73 +2280,61 @@ static int flush_out_fd(long out_fd, WS* ws) {
     return 0;
 }
 
+static int stream_fill(long in_fd, uint8_t* buf, size_t cap, size_t* avail, int* eof) {
+    while (!*eof && *avail < cap) {
+        long r = sys3(SYS_read, in_fd, (long)(buf + *avail), (long)(cap - *avail));
+        if (r < 0) return -1;
+        if (r == 0) { *eof = 1; break; }
+        *avail += (size_t)r;
+    }
+    return 0;
+}
+
+#ifndef STREAM_INIT_CAP
+#define STREAM_INIT_CAP (3u << 20)
+#endif
+
 static int run_cases_file_impl(const char* in_path, const char* out_path, int force_sse2, int exit_on_ok) {
     long in_fd = sys4(SYS_openat, AT_FDCWD, (long)in_path, O_RDONLY, 0);
     if (in_fd < 0) return -1;
     long sz_l = sys3(SYS_lseek, in_fd, 0, SEEK_END);
     if (sz_l <= 0) { sys1(SYS_close, in_fd); return -1; }
     size_t in_len = (size_t)sz_l;
+    if (sys3(SYS_lseek, in_fd, 0, 0) < 0) { sys1(SYS_close, in_fd); return -1; }
 
-    // Zero-copy read-only shared file mmap for 100% of files (all SIMD loops are bounds-checked against in_len).
-    uint8_t* mmap_base = NULL;
-    size_t mmap_len = 0;
-    uint8_t* base = NULL;
+    // Streaming SYS_read into a single compact anonymous arena (zero file-backed mmap!).
+    // Holds any typical <=3 MB case in one pass; automatically grows & retries if a single case exceeds in_cap.
+    size_t in_cap = in_len < STREAM_INIT_CAP ? in_len : STREAM_INIT_CAP;
+    if (in_cap < 4096) in_cap = 4096;
+    in_cap = (in_cap + 4095) & ~(size_t)4095;
 
     size_t est_lines = in_len / 240;
     if (est_lines < 1024) est_lines = 1024;
     if (est_lines > 42000) est_lines = 42000;
-    size_t arena_sz = est_lines * 36 + (960u << 10);
+    size_t arena_sz = in_cap + est_lines * 36 + (960u << 10);
     if (arena_sz < (1024u << 10)) arena_sz = (1024u << 10);
-    {
-        long mp = sys6(SYS_mmap, 0, (long)in_len, PROT_READ, MAP_SHARED | MAP_POPULATE, in_fd, 0);
-        if (mp < 0 && mp > -4096) {
-            mp = sys6(SYS_mmap, 0, (long)in_len, PROT_READ, MAP_PRIVATE | MAP_POPULATE, in_fd, 0);
-        }
-        if (mp < 0 && mp > -4096) {
-            mp = sys6(SYS_mmap, 0, (long)in_len, PROT_READ, MAP_PRIVATE, in_fd, 0);
-        }
-        if (!(mp < 0 && mp > -4096)) {
-            mmap_base = (uint8_t*)mp;
-            mmap_len = in_len;
-            base = mmap_base;
-        }
-    }
 
     WS ws;
     mem_zero_bytes(&ws, sizeof(ws));
-    if (!base) arena_sz += in_len + 64;
     if (arena_init(&ws.arena, arena_sz) < 0) {
-        if (mmap_base) os_munmap(mmap_base, mmap_len);
         sys1(SYS_close, in_fd);
         return -1;
     }
 
-    if (!base) {
-        base = (uint8_t*)arena_alloc(&ws.arena, in_len + 64, 32);
-        if (!base) { arena_free(&ws.arena); sys1(SYS_close, in_fd); return -1; }
-        size_t got = 0;
-        while (got < in_len) {
-            long r = sys4(SYS_pread64, in_fd, (long)(base + got), (long)(in_len - got), (long)got);
-            if (r <= 0) break;
-            got += (size_t)r;
-        }
-        if (got != in_len) { arena_free(&ws.arena); sys1(SYS_close, in_fd); return -1; }
-        mem_zero_bytes(base + in_len, 64);
-    }
-    sys1(SYS_close, in_fd);
+    uint8_t* base = (uint8_t*)arena_alloc(&ws.arena, in_cap, 32);
+    if (!base) { arena_free(&ws.arena); sys1(SYS_close, in_fd); return -1; }
 
     int use_avx2 = force_sse2 ? 0 : cpu_has_avx2();
 
     // Open output file upfront so we can stream-flush each case from a small reused 576 KB buffer.
     long out_fd = sys4(SYS_openat, AT_FDCWD, (long)out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd < 0) {
-        if (mmap_base) os_munmap(mmap_base, mmap_len);
         arena_free(&ws.arena);
+        sys1(SYS_close, in_fd);
         return -1;
     }
     sys2(SYS_fchmod, out_fd, 0644);
 
-    // Pre-size reusable per-case arrays once (zero doubling on standard 30K-40K line inputs).
     if (ensure_u32(&ws.arena, &ws.old_off, &ws.old_off_cap, 0, est_lines + 16) < 0 ||
         ensure_u32(&ws.arena, &ws.new_off, &ws.new_off_cap, 0, est_lines + 16) < 0 ||
         ensure_u32(&ws.arena, &ws.a_ids, &ws.a_ids_cap, 0, est_lines + 16) < 0 ||
@@ -2322,131 +2348,233 @@ static int run_cases_file_impl(const char* in_path, const char* out_path, int fo
     ws.out[0] = '[';
     ws.out_len = 1;
 
-    size_t p = skip_ws(base, 0, in_len);
-    if (p >= in_len || base[p] != '[') goto fail;
-    p = skip_ws(base, p + 1, in_len);
-    if (p < in_len && base[p] == ']') {
-        if (skip_ws(base, p + 1, in_len) != in_len) goto fail;
+    size_t avail = 0, p = 0;
+    int eof = 0;
+    if (stream_fill(in_fd, base, in_cap, &avail, &eof) < 0) goto fail;
+
+    for (;;) {
+        p = skip_ws(base, p, avail);
+        if (p < avail) break;
+        if (eof) goto fail;
+        avail = 0; p = 0;
+        if (stream_fill(in_fd, base, in_cap, &avail, &eof) < 0) goto fail;
+    }
+    if (base[p] != '[') goto fail;
+    p++;
+    for (;;) {
+        p = skip_ws(base, p, avail);
+        if (p < avail) break;
+        if (eof) goto fail;
+        avail = 0; p = 0;
+        if (stream_fill(in_fd, base, in_cap, &avail, &eof) < 0) goto fail;
+    }
+    if (base[p] == ']') {
+        p++;
+        for (;;) {
+            p = skip_ws(base, p, avail);
+            if (p < avail) goto fail;
+            if (eof) break;
+            avail = 0; p = 0;
+            if (stream_fill(in_fd, base, in_cap, &avail, &eof) < 0) goto fail;
+        }
         ws.out[ws.out_len++] = ']';
         if (flush_out_fd(out_fd, &ws) < 0) goto fail;
         sys1(SYS_close, out_fd);
+        sys1(SYS_close, in_fd);
         if (exit_on_ok) sys1(SYS_exit_group, 0);
-        if (mmap_base) os_munmap(mmap_base, mmap_len);
         arena_free(&ws.arena);
         return 0;
     }
 
     size_t case_idx = 0;
     for (;;) {
-        p = skip_ws(base, p, in_len);
-        if (p >= in_len || base[p] != '{') goto fail;
-        p = skip_ws(base, p + 1, in_len);
+        // Compact remaining unread bytes to front of streaming buffer and top up from in_fd.
+        if (p > 0) {
+            size_t rem = avail - p;
+            if (rem > 0) mem_move_left(base, base + p, rem);
+            avail = rem;
+            p = 0;
+        }
+        if (!eof && avail < in_cap) {
+            if (stream_fill(in_fd, base, in_cap, &avail, &eof) < 0) goto fail;
+        }
+
+        size_t saved_out_len = ws.out_len;
+        int need_grow = 0;
+        size_t cur_p = skip_ws(base, 0, avail);
+        if (cur_p >= avail) {
+            if (eof) goto fail;
+            avail = 0; p = 0;
+            continue;
+        }
+        if (base[cur_p] != '{') goto fail;
+        cur_p = skip_ws(base, cur_p + 1, avail);
+        if (cur_p >= avail) { need_grow = 1; goto check_grow; }
+
         int solved = 0;
-        while (p < in_len && base[p] != '}') {
-            if (base[p] != '"') goto fail;
-            size_t ks = p + 1;
-            size_t keq = skip_json_string(base, ks, in_len);
-            if (keq == (size_t)-1) goto fail;
+        int old_bare = 0, new_bare = 0;
+        while (cur_p < avail && base[cur_p] != '}') {
+            if (base[cur_p] != '"') goto fail;
+            size_t ks = cur_p + 1;
+            size_t keq = skip_json_string(base, ks, avail);
+            if (keq == SCAN_ERR) goto fail;
+            if (keq == SCAN_TRUNC) { need_grow = 1; goto check_grow; }
             size_t klen = (keq - 1) - ks;
-            p = skip_ws(base, keq, in_len);
-            if (p >= in_len || base[p] != ':') goto fail;
-            p = skip_ws(base, p + 1, in_len);
+            cur_p = skip_ws(base, keq, avail);
+            if (cur_p >= avail) { need_grow = 1; goto check_grow; }
+            if (base[cur_p] != ':') goto fail;
+            cur_p = skip_ws(base, cur_p + 1, avail);
+            if (cur_p >= avail) { need_grow = 1; goto check_grow; }
 
             if (klen == 5 && eq_bytes_sse2(base + ks, (const uint8_t*)"input", 5)) {
-                if (solved || p >= in_len || base[p] != '{') goto fail;
-                p = skip_ws(base, p + 1, in_len);
-                int old_done = 0, new_done = 0, old_bare = 0, new_bare = 0;
-                size_t deferred_new = (size_t)-1;
+                if (solved || base[cur_p] != '{') goto fail;
+                cur_p = skip_ws(base, cur_p + 1, avail);
+                if (cur_p >= avail) { need_grow = 1; goto check_grow; }
+                int old_done = 0, new_done = 0;
+                old_bare = 0; new_bare = 0;
+                size_t deferred_new = SCAN_ERR;
                 size_t ht_est = in_len / 320;
                 if (ht_est < 1024) ht_est = 1024;
                 if (ht_est > 32768) ht_est = 32768;
                 if (intern_reset(&ws, ht_est, use_avx2) < 0) goto fail;
 
-                while (p < in_len && base[p] != '}') {
-                    if (base[p] != '"') goto fail;
-                    size_t iks = p + 1;
-                    size_t ikeq = skip_json_string(base, iks, in_len);
-                    if (ikeq == (size_t)-1) goto fail;
+                while (cur_p < avail && base[cur_p] != '}') {
+                    if (base[cur_p] != '"') goto fail;
+                    size_t iks = cur_p + 1;
+                    size_t ikeq = skip_json_string(base, iks, avail);
+                    if (ikeq == SCAN_ERR) goto fail;
+                    if (ikeq == SCAN_TRUNC) { need_grow = 1; goto check_grow; }
                     size_t iklen = (ikeq - 1) - iks;
-                    p = skip_ws(base, ikeq, in_len);
-                    if (p >= in_len || base[p] != ':') goto fail;
-                    p = skip_ws(base, p + 1, in_len);
+                    cur_p = skip_ws(base, ikeq, avail);
+                    if (cur_p >= avail) { need_grow = 1; goto check_grow; }
+                    if (base[cur_p] != ':') goto fail;
+                    cur_p = skip_ws(base, cur_p + 1, avail);
+                    if (cur_p >= avail) { need_grow = 1; goto check_grow; }
 
                     if (iklen == 3 && base[iks] == 'o' && base[iks + 1] == 'l' && base[iks + 2] == 'd') {
-                        if (old_done || p >= in_len || base[p] != '"') goto fail;
-                        p = use_avx2 ? scan_json_old_avx2(&ws, base, p + 1, in_len, &old_bare)
-                                     : scan_json_old_sse2(&ws, base, p + 1, in_len, &old_bare);
-                        if (p == (size_t)-1) goto fail;
+                        if (old_done || base[cur_p] != '"') goto fail;
+                        cur_p = use_avx2 ? scan_json_old_avx2(&ws, base, cur_p + 1, avail, &old_bare)
+                                         : scan_json_old_sse2(&ws, base, cur_p + 1, avail, &old_bare);
+                        if (cur_p == SCAN_ERR) goto fail;
+                        if (cur_p == SCAN_TRUNC) { need_grow = 1; goto check_grow; }
                         old_done = 1;
-                        if (deferred_new != (size_t)-1) {
-                            size_t r = use_avx2 ? scan_json_new_avx2(&ws, base, deferred_new, in_len, old_bare, &new_bare)
-                                                : scan_json_new_sse2(&ws, base, deferred_new, in_len, old_bare, &new_bare);
-                            if (r == (size_t)-1) goto fail;
-                            new_done = 1; deferred_new = (size_t)-1;
+                        if (deferred_new != SCAN_ERR) {
+                            size_t r = use_avx2 ? scan_json_new_avx2(&ws, base, deferred_new, avail, old_bare, &new_bare)
+                                                : scan_json_new_sse2(&ws, base, deferred_new, avail, old_bare, &new_bare);
+                            if (r == SCAN_ERR) goto fail;
+                            if (r == SCAN_TRUNC) { need_grow = 1; goto check_grow; }
+                            new_done = 1; deferred_new = SCAN_ERR;
                         }
                     } else if (iklen == 3 && base[iks] == 'n' && base[iks + 1] == 'e' && base[iks + 2] == 'w') {
-                        if (new_done || deferred_new != (size_t)-1 || p >= in_len || base[p] != '"') goto fail;
+                        if (new_done || deferred_new != SCAN_ERR || base[cur_p] != '"') goto fail;
                         if (old_done) {
-                            p = use_avx2 ? scan_json_new_avx2(&ws, base, p + 1, in_len, old_bare, &new_bare)
-                                         : scan_json_new_sse2(&ws, base, p + 1, in_len, old_bare, &new_bare);
-                            if (p == (size_t)-1) goto fail;
+                            cur_p = use_avx2 ? scan_json_new_avx2(&ws, base, cur_p + 1, avail, old_bare, &new_bare)
+                                             : scan_json_new_sse2(&ws, base, cur_p + 1, avail, old_bare, &new_bare);
+                            if (cur_p == SCAN_ERR) goto fail;
+                            if (cur_p == SCAN_TRUNC) { need_grow = 1; goto check_grow; }
                             new_done = 1;
                         } else {
-                            deferred_new = p + 1;
-                            p = skip_json_string(base, p + 1, in_len);
-                            if (p == (size_t)-1) goto fail;
+                            deferred_new = cur_p + 1;
+                            cur_p = skip_json_string(base, cur_p + 1, avail);
+                            if (cur_p == SCAN_ERR) goto fail;
+                            if (cur_p == SCAN_TRUNC) { need_grow = 1; goto check_grow; }
                         }
                     } else {
-                        p = skip_json_value(base, p, in_len);
-                        if (p == (size_t)-1) goto fail;
+                        cur_p = skip_json_value(base, cur_p, avail);
+                        if (cur_p == SCAN_ERR) goto fail;
+                        if (cur_p == SCAN_TRUNC) { need_grow = 1; goto check_grow; }
                     }
-                    p = skip_ws(base, p, in_len);
-                    if (p < in_len && base[p] == ',') p = skip_ws(base, p + 1, in_len);
+                    cur_p = skip_ws(base, cur_p, avail);
+                    if (cur_p >= avail) { need_grow = 1; goto check_grow; }
+                    if (base[cur_p] == ',') {
+                        cur_p = skip_ws(base, cur_p + 1, avail);
+                        if (cur_p >= avail) { need_grow = 1; goto check_grow; }
+                    }
                 }
-                if (p >= in_len || base[p] != '}' || !old_done || !new_done) goto fail;
-                p++;
-
-                if (ensure_out(&ws, ws.out_len + 4) < 0) goto fail;
-                if (case_idx > 0) ws.out[ws.out_len++] = ',';
-                ws.out[ws.out_len++] = '"';
-                uint32_t td = 0, ti = 0;
-                int mrc = use_avx2 ? run_myers_avx2(&ws, &td, &ti) : run_myers_sse2(&ws, &td, &ti);
-                if (mrc < 0) goto fail;
-                int frc = use_avx2 ? format_hunks_json_avx2(&ws, base, old_bare, new_bare, td, ti)
-                                   : format_hunks_json_sse2(&ws, base, old_bare, new_bare, td, ti);
-                if (frc < 0) goto fail;
-                if (ensure_out(&ws, ws.out_len + 2) < 0) goto fail;
-                ws.out[ws.out_len++] = '"';
+                if (cur_p >= avail) { need_grow = 1; goto check_grow; }
+                if (base[cur_p] != '}' || !old_done || !new_done) goto fail;
+                cur_p++;
                 solved = 1;
             } else {
-                p = skip_json_value(base, p, in_len);
-                if (p == (size_t)-1) goto fail;
+                cur_p = skip_json_value(base, cur_p, avail);
+                if (cur_p == SCAN_ERR) goto fail;
+                if (cur_p == SCAN_TRUNC) { need_grow = 1; goto check_grow; }
             }
-            p = skip_ws(base, p, in_len);
-            if (p < in_len && base[p] == ',') p = skip_ws(base, p + 1, in_len);
+            cur_p = skip_ws(base, cur_p, avail);
+            if (cur_p >= avail) { need_grow = 1; goto check_grow; }
+            if (base[cur_p] == ',') {
+                cur_p = skip_ws(base, cur_p + 1, avail);
+                if (cur_p >= avail) { need_grow = 1; goto check_grow; }
+            }
         }
-        if (!solved || p >= in_len || base[p] != '}') goto fail;
-        p = skip_ws(base, p + 1, in_len);
+        if (cur_p >= avail) { need_grow = 1; goto check_grow; }
+        if (!solved || base[cur_p] != '}') goto fail;
+        cur_p++;
+
+    check_grow:
+        if (__builtin_expect(need_grow, 0)) {
+            if (eof) goto fail;
+            ws.out_len = saved_out_len;
+            size_t new_cap = in_cap * 2;
+            size_t max_cap = ((in_len + 4095) & ~(size_t)4095);
+            if (new_cap > max_cap) new_cap = max_cap;
+            if (new_cap <= in_cap) goto fail;
+            uint8_t* nbuf = (uint8_t*)arena_alloc(&ws.arena, new_cap, 32);
+            if (!nbuf) goto fail;
+            if (avail > 0) mem_copy_bytes(nbuf, base, avail);
+            base = nbuf;
+            in_cap = new_cap;
+            p = 0;
+            continue;
+        }
+
+        // Complete case parsed in base[0..cur_p): run Myers + format output!
+        if (ensure_out(&ws, ws.out_len + 4) < 0) goto fail;
+        if (case_idx > 0) ws.out[ws.out_len++] = ',';
+        ws.out[ws.out_len++] = '"';
+        uint32_t td = 0, ti = 0;
+        int mrc = use_avx2 ? run_myers_avx2(&ws, &td, &ti) : run_myers_sse2(&ws, &td, &ti);
+        if (mrc < 0) goto fail;
+        int frc = use_avx2 ? format_hunks_json_avx2(&ws, base, old_bare, new_bare, td, ti)
+                           : format_hunks_json_sse2(&ws, base, old_bare, new_bare, td, ti);
+        if (frc < 0) goto fail;
+        if (ensure_out(&ws, ws.out_len + 2) < 0) goto fail;
+        ws.out[ws.out_len++] = '"';
+
+        p = cur_p;
         case_idx++;
-        if (p < in_len && base[p] == ',') {
-            // Stream-flush this case's output so ws.out stays inside a single 700 KB buffer.
+        for (;;) {
+            p = skip_ws(base, p, avail);
+            if (p < avail) break;
+            if (eof) goto fail;
+            avail = 0; p = 0;
+            if (stream_fill(in_fd, base, in_cap, &avail, &eof) < 0) goto fail;
+        }
+        if (base[p] == ',') {
             if (flush_out_fd(out_fd, &ws) < 0) goto fail;
             p++;
             continue;
         }
-        if (p < in_len && base[p] == ']') {
-            if (skip_ws(base, p + 1, in_len) != in_len) goto fail;
+        if (base[p] == ']') {
+            p++;
+            for (;;) {
+                p = skip_ws(base, p, avail);
+                if (p < avail) goto fail;
+                if (eof) break;
+                avail = 0; p = 0;
+                if (stream_fill(in_fd, base, in_cap, &avail, &eof) < 0) goto fail;
+            }
             if (ensure_out(&ws, ws.out_len + 1) < 0) goto fail;
             ws.out[ws.out_len++] = ']';
             if (flush_out_fd(out_fd, &ws) < 0) goto fail;
 #ifdef STANDALONE_TEST
-            fprintf(stderr, "[stats] arena_blocks=%d arena_used=%zuKB ht_cap=%zu entries_cap=%zu out_cap=%zuKB a_cap=%zu o_cap=%zu\n",
-                ws.arena.n_blocks, ws.arena.used >> 10, ws.ht_cap, ws.entries_cap, ws.out_cap >> 10, ws.a_ids_cap, ws.old_off_cap);
+            fprintf(stderr, "[stats] arena_blocks=%d arena_used=%zuKB in_cap=%zuKB ht_cap=%zu entries_cap=%zu out_cap=%zuKB a_cap=%zu o_cap=%zu\n",
+                ws.arena.n_blocks, ws.arena.used >> 10, in_cap >> 10, ws.ht_cap, ws.entries_cap, ws.out_cap >> 10, ws.a_ids_cap, ws.old_off_cap);
 #endif
             sys1(SYS_close, out_fd);
+            sys1(SYS_close, in_fd);
             // Standard _exit(0) after output file is flushed and closed to skip redundant munmap/V8 teardown on one-shot CLI runs.
             if (exit_on_ok) sys1(SYS_exit_group, 0);
-            if (mmap_base) os_munmap(mmap_base, mmap_len);
             arena_free(&ws.arena);
             return 0;
         }
@@ -2455,7 +2583,7 @@ static int run_cases_file_impl(const char* in_path, const char* out_path, int fo
 
 fail:
     sys1(SYS_close, out_fd);
-    if (mmap_base) os_munmap(mmap_base, mmap_len);
+    sys1(SYS_close, in_fd);
     arena_free(&ws.arena);
     return -1;
 }
