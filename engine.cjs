@@ -253,6 +253,7 @@ function runCasesFile(inPath, outPath) {
 
   const outLen = w.solve_cases_json(inPtr, got);
   const outFd = fs.openSync(outPath, 'w', 0o644);
+  try { fs.fchmodSync(outFd, 0o644); } catch {}
   if (outLen >= 0) {
     const outPtr = w.get_out_ptr();
     const src = new Uint8Array(w.memory.buffer, outPtr, outLen);
