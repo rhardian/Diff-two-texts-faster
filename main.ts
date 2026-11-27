@@ -1,12 +1,20 @@
-// Fast exact makefun-diff 1.0.0 driver: tunes V8 flags for single-CPU cold execution,
-// reads /input/cases.json directly into WASM linear memory, and writes /output/answers.json.
-require('node:v8').setFlagsFromString(
-  '--no-incremental-marking --no-wasm-tier-up --no-concurrent-recompilation --no-concurrent-marking --no-parallel-scavenge'
-);
+// Exact makefun-diff 1.0.0 driver:
+// Fast path on Linux x86_64 uses zero-libc AVX2/SSE2 N-API addon (diff.node) with zero require() overhead;
+// automatically falls back to SIMD128 WebAssembly + pure-JS engine (engine.cjs) on other platforms or non-canonical JSON.
+const inFile = (process.env.MAKEFUN_INPUT_DIR || '/input') + '/cases.json';
+const outFile = (process.env.MAKEFUN_OUTPUT_DIR || '/output') + '/answers.json';
 
-const { runCasesFile } = require('./engine.cjs');
+let done = false;
+if (process.platform === 'linux' && process.arch === 'x64') {
+  try {
+    process.dlopen(module, __dirname + '/diff.node');
+    done = module.exports.runFile(inFile, outFile) === 0;
+  } catch {}
+}
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-
-runCasesFile(INPUT_DIR + '/cases.json', OUTPUT_DIR + '/answers.json');
+if (!done) {
+  require('node:v8').setFlagsFromString(
+    '--no-incremental-marking --no-wasm-tier-up --no-concurrent-recompilation --no-concurrent-marking --no-parallel-scavenge'
+  );
+  require('./engine.cjs').runCasesFile(inFile, outFile);
+}
